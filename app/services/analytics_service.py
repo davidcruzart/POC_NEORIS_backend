@@ -1,13 +1,20 @@
-import json
-import re
-from typing import Any
+import logging
+from typing import List, Tuple
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
+from markitdown import MarkItDown
+from pydantic import BaseModel, Field
 
 from app.core.config import DEFAULT_MODEL_NAME
-from app.prompts.analytics_prompts import ANALYTICS_INSIGHTS_PROMPT
-from app.schemas.analytics import ChartPoint, ChartSeries, ChartSpec
+from app.prompts.analytics_prompts import FINANCIAL_EXTRACTION_PROMPT
+from app.schemas.analytics import ChartPoint, ChartSeries, ChartSpec, FinancialRow
+
+logger = logging.getLogger(__name__)
+
+
+class FinancialTable(BaseModel):
+    rows: List[FinancialRow] = Field(default_factory=list)
 
 
 class AnalyticsService:
@@ -15,304 +22,343 @@ class AnalyticsService:
         self.llm = ChatOpenAI(
             model=DEFAULT_MODEL_NAME,
             temperature=0,
-        )
-        self.insights_prompt = ChatPromptTemplate.from_template(
-            ANALYTICS_INSIGHTS_PROMPT
-        )
+        ).with_structured_output(FinancialTable)
 
-    def analyze(self, text: str, document_type: str) -> dict:
-        rows = self._extract_financial_rows(text)
-        chart_specs = self._build_chart_specs(rows)
-        insights = self._generate_insights(rows)
+        self.prompt = ChatPromptTemplate.from_template(FINANCIAL_EXTRACTION_PROMPT)
 
-        warnings = []
+    def analyze(
+        self,
+        raw_text: str,
+        document_type: str,
+        file_bytes: bytes | None = None,
+    ) -> dict:
+        context = self._get_structured_context(raw_text, file_bytes)
+        unit_multiplier = self._detect_unit_multiplier(context)
 
-        if not rows:
-            warnings.append(
-                "No se pudieron extraer filas financieras estructuradas del documento."
+        filtered_context = self._filter_relevant_sections(context)
+
+        raw_rows = self._extract_semantic_rows(filtered_context)
+
+        if not raw_rows and filtered_context != context:
+            logger.warning(
+                "No se extrajeron filas desde el contexto filtrado. "
+                "Reintentando con contexto completo recortado."
             )
+            raw_rows = self._extract_semantic_rows(context[:50_000])
 
-        if rows and not chart_specs:
-            warnings.append(
-                "Se extrajeron métricas financieras, pero no suficientes datos agrupables para generar gráficas útiles."
-            )
+        clean_rows = self._validate_and_clean_rows(
+            rows=raw_rows,
+            unit_multiplier=unit_multiplier,
+        )
+
+        prioritized_rows = self._prioritize_rows(clean_rows)
+
+        chart_specs = self._build_chart_specs(prioritized_rows)
+        insights = self._generate_insights(prioritized_rows)
 
         return {
             "document_type": document_type,
-            "rows": rows,
-            "metrics": self._build_metrics_preview(rows),
-            "percentages": self._build_percentages_preview(rows),
+            "rows": prioritized_rows,
+            "metrics": self._build_metrics_preview(prioritized_rows),
+            "percentages": self._build_percentages_preview(prioritized_rows),
             "chart_specs": chart_specs,
             "insights": insights,
-            "warnings": warnings,
+            "warnings": self._generate_warnings(raw_rows, prioritized_rows),
             "metadata": {
-                "rows_detected": len(rows),
+                "raw_count": len(raw_rows),
+                "validated_count": len(prioritized_rows),
                 "chart_specs_generated": len(chart_specs),
                 "insights_generated": len(insights),
+                "unit_multiplier": unit_multiplier,
+                "method": "hybrid_markitdown_llm_semantic_windows",
             },
         }
 
-    # ---------------------------------------------------------
-    # MAIN EXTRACTION
-    # ---------------------------------------------------------
+    def _get_structured_context(self, text: str, file_bytes: bytes | None) -> str:
+        if file_bytes:
+            try:
+                md = MarkItDown()
+                result = md.convert_binary(file_bytes)
 
-    def _extract_financial_rows(self, text: str) -> list[dict[str, Any]]:
-        sections = self._split_financial_sections(text)
+                if result and result.text_content:
+                    return result.text_content
 
-        rows: list[dict[str, Any]] = []
+            except Exception as exc:
+                logger.warning("Fallo en MarkItDown, usando texto plano: %s", exc)
 
-        for statement, section_text in sections.items():
-            rows.extend(self._extract_rows_from_statement(statement, section_text))
-
-        return self._deduplicate_rows(rows)
-
-    def _split_financial_sections(self, text: str) -> dict[str, str]:
-        markers = [
-            ("income_statement", "CONDENSED CONSOLIDATED STATEMENTS OF OPERATIONS"),
-            ("balance_sheet", "CONDENSED CONSOLIDATED BALANCE SHEETS"),
-            ("cash_flow", "CONDENSED CONSOLIDATED STATEMENTS OF CASH FLOWS"),
-        ]
-
-        upper_text = text.upper()
-        positions = []
-
-        for key, marker in markers:
-            position = upper_text.find(marker)
-            if position != -1:
-                positions.append((key, position))
-
-        positions.sort(key=lambda item: item[1])
-
-        sections = {}
-
-        for index, (key, start) in enumerate(positions):
-            end = len(text)
-
-            if index + 1 < len(positions):
-                end = positions[index + 1][1]
-
-            sections[key] = text[start:end]
-
-        return sections
-
-    def _extract_rows_from_statement(
-        self,
-        statement: str,
-        statement_text: str,
-    ) -> list[dict[str, Any]]:
-        lines = self._normalize_lines(statement_text)
-        unit = self._extract_unit(statement_text)
-        periods = self._extract_periods(lines)
-
-        current_section = "general"
-        rows = []
-
-        for line in lines:
-            detected_section = self._detect_section(line, statement)
-
-            if detected_section:
-                current_section = detected_section
-                continue
-
-            parsed = self._parse_two_value_row(line)
-
-            if not parsed:
-                continue
-
-            label, value_1, value_2 = parsed
-
-            row = {
-                "statement": statement,
-                "section": current_section,
-                "label": label,
-                "period_1": periods[0] if len(periods) >= 1 else None,
-                "value_1": value_1,
-                "period_2": periods[1] if len(periods) >= 2 else None,
-                "value_2": value_2,
-                "unit": unit,
-                "delta_abs": round(value_1 - value_2, 2),
-                "delta_pct": self._calculate_delta_pct(value_1, value_2),
-            }
-
-            rows.append(row)
-
-        return rows
-
-    # ---------------------------------------------------------
-    # TEXT NORMALIZATION
-    # ---------------------------------------------------------
+        return text
 
     @staticmethod
-    def _normalize_lines(text: str) -> list[str]:
-        lines = []
-
-        for raw_line in text.splitlines():
-            line = " ".join(raw_line.strip().split())
-
-            if line:
-                lines.append(line)
-
-        return lines
-
-    @staticmethod
-    def _extract_unit(text: str) -> str:
+    def _detect_unit_multiplier(text: str) -> int:
         lowered = text.lower()
 
-        if "(in millions" in lowered:
-            return "millions"
+        if "in millions" in lowered or "in millions," in lowered:
+            return 1_000_000
 
-        if "(in thousands" in lowered:
-            return "thousands"
+        if "in thousands" in lowered or "in thousands," in lowered:
+            return 1_000
 
-        return "units"
+        if "en millones" in lowered:
+            return 1_000_000
 
-    def _extract_periods(self, lines: list[str]) -> list[str]:
-        periods = []
-        max_scan = min(len(lines), 35)
+        if "en miles" in lowered:
+            return 1_000
 
-        full_text = "\n".join(lines[:max_scan])
+        return 1
 
-        direct_pattern = re.compile(
-            r"(December|September|June|March)\s+\d{1,2},\s+\d{4}",
-            re.IGNORECASE,
-        )
+    def _filter_relevant_sections(self, text: str) -> str:
+        headers = [
+            "CONDENSED CONSOLIDATED STATEMENTS OF OPERATIONS",
+            "CONDENSED CONSOLIDATED BALANCE SHEETS",
+            "CONDENSED CONSOLIDATED STATEMENTS OF CASH FLOWS",
+            "CONDENSED CONSOLIDATED STATEMENTS OF COMPREHENSIVE INCOME",
+            "CONDENSED CONSOLIDATED STATEMENTS OF SHAREHOLDERS’ EQUITY",
+            "CONDENSED CONSOLIDATED STATEMENTS OF SHAREHOLDERS' EQUITY",
+            "Note 2",
+            "Note 3",
+            "Note 4",
+            "Note 5",
+            "Note 10",
+            "Revenue",
+            "Segment Information",
+            "Products and Services Performance",
+            "Segment Operating Performance",
+            "Gross Margin",
+            "Operating Expenses",
+            "Provision for Income Taxes",
+            "Liquidity and Capital Resources",
+        ]
 
-        for match in direct_pattern.findall(full_text):
-            pass
+        lines = text.splitlines()
+        selected_content: list[str] = []
+        used_ranges: list[tuple[int, int]] = []
 
-        direct_dates = re.findall(
-            r"(?:December|September|June|March)\s+\d{1,2},\s+\d{4}",
-            full_text,
-            flags=re.IGNORECASE,
-        )
+        window_size = 120
 
-        for date in direct_dates:
-            normalized = self._normalize_period(date)
-            if normalized not in periods:
-                periods.append(normalized)
+        for header in headers:
+            normalized_header = self._normalize_header(header)
 
-        if len(periods) >= 2:
-            return periods[:2]
+            for index, line in enumerate(lines):
+                normalized_line = self._normalize_header(line)
 
-        # Caso típico en PDFs parseados:
-        # December 27,
-        # 2025
-        split_dates = []
+                if normalized_header in normalized_line:
+                    start = index
+                    end = min(index + window_size, len(lines))
 
-        for index, line in enumerate(lines[:max_scan]):
-            if re.search(r"(December|September|June|March)\s+\d{1,2},$", line, re.IGNORECASE):
-                if index + 1 < len(lines):
-                    next_line = lines[index + 1]
-                    year_match = re.search(r"\b(19\d{2}|20\d{2})\b", next_line)
+                    if self._range_already_used(start, end, used_ranges):
+                        continue
 
-                    if year_match:
-                        split_dates.append(f"{line} {year_match.group(1)}")
+                    selected_content.extend(lines[start:end])
+                    selected_content.append("\n")
+                    used_ranges.append((start, end))
+                    break
 
-        for date in split_dates:
-            normalized = self._normalize_period(date)
-            if normalized not in periods:
-                periods.append(normalized)
+        if selected_content:
+            return "\n".join(selected_content)[:50_000]
 
-        return periods[:2]
+        fallback_lines = [
+            line
+            for line in lines
+            if self._line_looks_financial(line)
+        ]
 
-    @staticmethod
-    def _normalize_period(period: str) -> str:
-        return " ".join(period.replace("\n", " ").split())
+        if fallback_lines:
+            return "\n".join(fallback_lines[:4_000])[:50_000]
 
-    # ---------------------------------------------------------
-    # SECTIONS
-    # ---------------------------------------------------------
-
-    def _detect_section(self, line: str, statement: str) -> str | None:
-        normalized = self._normalize_section_line(line)
-
-        section_maps = {
-            "income_statement": {
-                "net sales": "net_sales",
-                "cost of sales": "cost_of_sales",
-                "operating expenses": "operating_expenses",
-                "earnings per share": "earnings_per_share",
-                "shares used in computing earnings per share": "shares_for_eps",
-                "net sales by reportable segment": "net_sales_by_segment",
-                "net sales by category": "net_sales_by_category",
-            },
-            "balance_sheet": {
-                "assets": "assets",
-                "current assets": "current_assets",
-                "non-current assets": "non_current_assets",
-                "liabilities and shareholders equity": "liabilities_and_equity",
-                "current liabilities": "current_liabilities",
-                "non-current liabilities": "non_current_liabilities",
-                "shareholders equity": "shareholders_equity",
-            },
-            "cash_flow": {
-                "operating activities": "operating_activities",
-                "investing activities": "investing_activities",
-                "financing activities": "financing_activities",
-                "supplemental cash flow disclosure": "supplemental_cash_flow",
-            },
-        }
-
-        for section_label, section_name in section_maps.get(statement, {}).items():
-            if normalized == section_label:
-                return section_name
-
-        return None
+        return text[:50_000]
 
     @staticmethod
-    def _normalize_section_line(line: str) -> str:
-        normalized = line.lower().strip()
-
-        normalized = normalized.replace("’", "")
-        normalized = normalized.replace("'", "")
-        normalized = normalized.replace(":", "")
-        normalized = normalized.replace("(1)", "")
-        normalized = normalized.replace("/", " ")
-
+    def _normalize_header(value: str) -> str:
+        normalized = value.upper()
+        normalized = normalized.replace("—", "-")
+        normalized = normalized.replace("–", "-")
+        normalized = normalized.replace("’", "'")
         normalized = " ".join(normalized.split())
-
         return normalized
 
-    # ---------------------------------------------------------
-    # ROW PARSING
-    # ---------------------------------------------------------
+    @staticmethod
+    def _range_already_used(
+        start: int,
+        end: int,
+        used_ranges: list[tuple[int, int]],
+    ) -> bool:
+        for used_start, used_end in used_ranges:
+            overlaps = start < used_end and end > used_start
+            if overlaps:
+                return True
 
-    def _parse_two_value_row(self, line: str) -> tuple[str, float, float] | None:
-        cleaned = line
-
-        cleaned = cleaned.replace("$", "")
-        cleaned = cleaned.replace("(", "-")
-        cleaned = cleaned.replace(")", "")
-        cleaned = cleaned.replace("—", "-")
-
-        match = re.match(
-            r"^(?P<label>.+?)\s+(?P<value_1>-?\d[\d,]*\.?\d*)\s+(?P<value_2>-?\d[\d,]*\.?\d*)$",
-            cleaned,
-        )
-
-        if not match:
-            return None
-
-        label = match.group("label").strip(" :-")
-        value_1 = self._parse_number(match.group("value_1"))
-        value_2 = self._parse_number(match.group("value_2"))
-
-        if value_1 is None or value_2 is None:
-            return None
-
-        if self._should_skip_label(label):
-            return None
-
-        return label, value_1, value_2
+        return False
 
     @staticmethod
-    def _parse_number(value: str) -> float | None:
-        candidate = value.replace(",", "").strip()
+    def _line_looks_financial(line: str) -> bool:
+        lowered = line.lower()
+
+        keywords = [
+            "revenue",
+            "net sales",
+            "sales",
+            "income",
+            "gross margin",
+            "operating income",
+            "net income",
+            "assets",
+            "liabilities",
+            "equity",
+            "cash flow",
+            "operating activities",
+            "investing activities",
+            "financing activities",
+            "products",
+            "services",
+            "iphone",
+            "mac",
+            "ipad",
+            "wearables",
+            "americas",
+            "europe",
+            "greater china",
+            "china",
+            "japan",
+            "asia pacific",
+            "total",
+            "cost of sales",
+            "expenses",
+            "research and development",
+            "selling",
+            "general and administrative",
+        ]
+
+        return any(keyword in lowered for keyword in keywords) or any(
+            character.isdigit() for character in line
+        )
+
+    def _extract_semantic_rows(self, context: str) -> List[dict]:
+        if not context or not context.strip():
+            return []
 
         try:
-            return float(candidate)
-        except ValueError:
-            return None
+            chain = self.prompt | self.llm
+            result = chain.invoke({"texto": context[:50_000]})
+            return [row.model_dump() for row in result.rows]
+
+        except Exception as exc:
+            logger.error("Error en extracción LLM de analytics: %s", exc)
+            return []
+
+    def _validate_and_clean_rows(
+        self,
+        rows: List[dict],
+        unit_multiplier: int,
+    ) -> List[dict]:
+        clean_rows = []
+        seen: set[Tuple[str, float, float]] = set()
+
+        for row in rows:
+            label = str(row.get("label", "")).strip()
+            value_1 = row.get("value_1")
+            value_2 = row.get("value_2")
+
+            if not label or len(label) < 3:
+                continue
+
+            if self._is_noise_label(label):
+                continue
+
+            if not isinstance(value_1, (int, float)) or not isinstance(value_2, (int, float)):
+                continue
+
+            value_1 = float(value_1)
+            value_2 = float(value_2)
+
+            if abs(value_1) > 1_000_000_000_000 or abs(value_2) > 1_000_000_000_000:
+                continue
+
+            normalized_label = self._normalize_label(label)
+
+            key = (normalized_label.lower(), value_1, value_2)
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            normalized_value_1 = value_1 * unit_multiplier
+            normalized_value_2 = value_2 * unit_multiplier
+
+            cleaned_row = {
+                **row,
+                "label": normalized_label,
+                "value_1": normalized_value_1,
+                "value_2": normalized_value_2,
+                "raw_value_1": value_1,
+                "raw_value_2": value_2,
+                "unit_multiplier": unit_multiplier,
+                "delta_abs": round(normalized_value_1 - normalized_value_2, 2),
+                "delta_pct": self._calculate_delta_pct(
+                    normalized_value_1,
+                    normalized_value_2,
+                ),
+            }
+
+            clean_rows.append(cleaned_row)
+
+        return clean_rows
+
+    def _prioritize_rows(self, rows: List[dict]) -> List[dict]:
+        priority_map = {
+            "total net sales": 1,
+            "net sales": 2,
+            "revenue": 3,
+            "gross margin": 4,
+            "operating income": 5,
+            "net income": 6,
+            "income before provision for income taxes": 7,
+            "products": 8,
+            "services": 9,
+            "iphone": 10,
+            "mac": 11,
+            "ipad": 12,
+            "wearables, home and accessories": 13,
+            "americas": 14,
+            "europe": 15,
+            "greater china": 16,
+            "japan": 17,
+            "rest of asia pacific": 18,
+            "cash and cash equivalents": 19,
+            "total current assets": 20,
+            "total non-current assets": 21,
+            "total assets": 22,
+            "accounts payable": 23,
+            "total current liabilities": 24,
+            "total non-current liabilities": 25,
+            "total liabilities": 26,
+            "total shareholders’ equity": 27,
+            "total shareholders' equity": 27,
+            "total liabilities and shareholders’ equity": 28,
+            "total liabilities and shareholders' equity": 28,
+            "cash generated by operating activities": 29,
+            "cash generated by/(used in) investing activities": 30,
+            "cash used in financing activities": 31,
+        }
+
+        def priority(row: dict) -> tuple[int, float]:
+            normalized_label = self._normalize_priority_key(row.get("label", ""))
+            return (
+                priority_map.get(normalized_label, 999),
+                -abs(float(row.get("value_1", 0))),
+            )
+
+        return sorted(rows, key=priority)
+
+    @staticmethod
+    def _normalize_priority_key(label: str) -> str:
+        normalized = label.lower().strip()
+        normalized = normalized.replace("’", "'")
+        normalized = " ".join(normalized.split())
+        return normalized
+
+    @staticmethod
+    def _normalize_label(label: str) -> str:
+        return " ".join(label.strip().split())
 
     @staticmethod
     def _calculate_delta_pct(value_1: float, value_2: float) -> float | None:
@@ -322,246 +368,111 @@ class AnalyticsService:
         return round(((value_1 - value_2) / value_2) * 100, 2)
 
     @staticmethod
-    def _should_skip_label(label: str) -> bool:
+    def _is_noise_label(label: str) -> bool:
         lowered = label.lower()
 
         noise_patterns = [
-            "apple inc",
-            "three months ended",
-            "december",
-            "september",
-            "in millions",
-            "in thousands",
-            "unaudited",
-            "except number",
+            "date:",
+            "signature",
+            "certification",
+            "pursuant",
+            "registrant",
+            "commission",
+            "form 10-q",
+            "nasdaq",
+            "trading symbol",
             "par value",
             "authorized",
             "issued and outstanding",
+            "telephone number",
+            "exact name",
+            "address",
+            "zip code",
+            "page",
+            "exhibit",
+            "table of contents",
+            "transition report",
+            "common stock",
+            "securities registered",
+            "washington, d.c.",
+            "for the quarterly period",
+            "for the transition period",
+            "large accelerated filer",
+            "accelerated filer",
+            "non-accelerated filer",
+            "smaller reporting company",
+            "emerging growth company",
         ]
 
-        if any(pattern in lowered for pattern in noise_patterns):
-            return True
-
-        if len(label.strip()) < 2:
-            return True
-
-        return False
+        return any(pattern in lowered for pattern in noise_patterns)
 
     @staticmethod
-    def _deduplicate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        seen = set()
-        result = []
-
-        for row in rows:
-            key = (
-                row["statement"],
-                row["section"],
-                row["label"],
-                row["period_1"],
-                row["period_2"],
-                row["value_1"],
-                row["value_2"],
-            )
-
-            if key not in seen:
-                seen.add(key)
-                result.append(row)
-
-        return result
-
-    # ---------------------------------------------------------
-    # PREVIEWS
-    # ---------------------------------------------------------
-
-    @staticmethod
-    def _build_metrics_preview(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _build_metrics_preview(rows: List[dict]) -> List[dict]:
         return [
             {
                 "label": row["label"],
                 "value": row["value_1"],
-                "raw_value": str(row["value_1"]),
-                "context": f"{row['statement']} / {row['section']} / {row['period_1']}",
+                "raw_value": str(row["raw_value_1"]),
+                "context": row.get("statement") or row.get("section") or "Métrica financiera",
             }
             for row in rows[:30]
         ]
 
     @staticmethod
-    def _build_percentages_preview(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _build_percentages_preview(rows: List[dict]) -> List[dict]:
         percentages = []
 
         for row in rows:
-            if row["delta_pct"] is None:
+            delta_pct = row.get("delta_pct")
+
+            if delta_pct is None:
                 continue
 
             percentages.append(
                 {
                     "label": f"{row['label']} variation",
-                    "value": row["delta_pct"],
-                    "raw_value": f"{row['delta_pct']}%",
-                    "context": f"{row['period_1']} vs {row['period_2']}",
+                    "value": delta_pct,
+                    "raw_value": f"{delta_pct}%",
+                    "context": "Periodo actual vs periodo anterior",
                 }
             )
 
         return percentages[:30]
 
-    # ---------------------------------------------------------
-    # CHARTS
-    # ---------------------------------------------------------
+    def _build_chart_specs(self, rows: List[dict]) -> List[dict]:
+        if len(rows) < 2:
+            return []
 
-    def _build_chart_specs(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         chart_specs = []
 
-        for chart in [
-            self._build_kpi_chart(rows),
-            self._build_revenue_category_chart(rows),
-            self._build_revenue_segment_chart(rows),
-            self._build_cashflow_chart(rows),
-            self._build_delta_pct_chart(rows),
-        ]:
-            if chart:
-                chart_specs.append(chart)
+        main_chart = self._build_two_period_chart(
+            rows=rows[:10],
+            title="Métricas financieras clave",
+            x_label="Métrica",
+            y_label="Valor normalizado",
+            reason="Comparación entre el periodo actual y el periodo anterior para las métricas financieras principales extraídas.",
+        )
+
+        if main_chart:
+            chart_specs.append(main_chart)
+
+        variation_chart = self._build_variation_chart(rows)
+
+        if variation_chart:
+            chart_specs.append(variation_chart)
 
         return chart_specs
 
-    def _build_kpi_chart(self, rows: list[dict[str, Any]]) -> dict[str, Any] | None:
-        wanted = {
-            "Total net sales",
-            "Gross margin",
-            "Operating income",
-            "Net income",
-        }
-
-        selected = [
-            row for row in rows
-            if row["statement"] == "income_statement"
-            and row["label"] in wanted
-        ]
-
-        return self._build_two_period_bar_chart(
-            selected,
-            title="Key financial metrics",
-            x_label="Metric",
-            y_label="Value",
-            reason="Main income statement KPIs compared across both periods.",
-        )
-
-    def _build_revenue_category_chart(
-        self,
-        rows: list[dict[str, Any]],
-    ) -> dict[str, Any] | None:
-        selected = [
-            row for row in rows
-            if row["statement"] == "income_statement"
-            and row["section"] == "net_sales_by_category"
-            and "total" not in row["label"].lower()
-        ]
-
-        return self._build_two_period_bar_chart(
-            selected,
-            title="Net sales by category",
-            x_label="Category",
-            y_label="Net sales",
-            reason="Revenue breakdown by product and services category.",
-        )
-
-    def _build_revenue_segment_chart(
-        self,
-        rows: list[dict[str, Any]],
-    ) -> dict[str, Any] | None:
-        selected = [
-            row for row in rows
-            if row["statement"] == "income_statement"
-            and row["section"] == "net_sales_by_segment"
-            and "total" not in row["label"].lower()
-        ]
-
-        return self._build_two_period_bar_chart(
-            selected,
-            title="Net sales by reportable segment",
-            x_label="Segment",
-            y_label="Net sales",
-            reason="Revenue breakdown by geographic/reportable segment.",
-        )
-
-    def _build_cashflow_chart(
-        self,
-        rows: list[dict[str, Any]],
-    ) -> dict[str, Any] | None:
-        wanted = {
-            "Cash generated by operating activities",
-            "Cash generated by/(used in) investing activities",
-            "Cash used in financing activities",
-        }
-
-        selected = [
-            row for row in rows
-            if row["statement"] == "cash_flow"
-            and row["label"] in wanted
-        ]
-
-        return self._build_two_period_bar_chart(
-            selected,
-            title="Cash flow by activity",
-            x_label="Activity",
-            y_label="Cash flow",
-            reason="Comparison of operating, investing and financing cash flows.",
-        )
-
-    def _build_delta_pct_chart(
-        self,
-        rows: list[dict[str, Any]],
-    ) -> dict[str, Any] | None:
-        important_rows = [
-            row for row in rows
-            if row["delta_pct"] is not None
-            and row["statement"] == "income_statement"
-            and row["section"] in {
-                "net_sales_by_category",
-                "net_sales_by_segment",
-                "general",
-                "net_sales",
-            }
-            and "total" not in row["label"].lower()
-        ]
-
-        important_rows = important_rows[:10]
-
-        if len(important_rows) < 2:
-            return None
-
-        return ChartSpec(
-            chart_type="bar",
-            title="Percentage variation by metric",
-            x_label="Metric",
-            y_label="Variation (%)",
-            series=[
-                ChartSeries(
-                    name="Variation %",
-                    data=[
-                        ChartPoint(
-                            x=row["label"],
-                            y=row["delta_pct"],
-                        )
-                        for row in important_rows
-                    ],
-                )
-            ],
-            reason="Shows percentage changes between both periods.",
-        ).model_dump()
-
     @staticmethod
-    def _build_two_period_bar_chart(
-        rows: list[dict[str, Any]],
+    def _build_two_period_chart(
+        rows: List[dict],
         title: str,
         x_label: str,
         y_label: str,
         reason: str,
-    ) -> dict[str, Any] | None:
+    ) -> dict | None:
         if len(rows) < 2:
             return None
-
-        period_1 = rows[0].get("period_1") or "Current period"
-        period_2 = rows[0].get("period_2") or "Previous period"
 
         return ChartSpec(
             chart_type="bar",
@@ -570,14 +481,14 @@ class AnalyticsService:
             y_label=y_label,
             series=[
                 ChartSeries(
-                    name=period_1,
+                    name="Periodo actual",
                     data=[
                         ChartPoint(x=row["label"], y=row["value_1"])
                         for row in rows
                     ],
                 ),
                 ChartSeries(
-                    name=period_2,
+                    name="Periodo anterior",
                     data=[
                         ChartPoint(x=row["label"], y=row["value_2"])
                         for row in rows
@@ -587,83 +498,65 @@ class AnalyticsService:
             reason=reason,
         ).model_dump()
 
-    # ---------------------------------------------------------
-    # LLM INSIGHTS
-    # ---------------------------------------------------------
+    @staticmethod
+    def _build_variation_chart(rows: List[dict]) -> dict | None:
+        variation_rows = [
+            row for row in rows
+            if row.get("delta_pct") is not None
+        ][:10]
 
-    def _generate_insights(self, rows: list[dict[str, Any]]) -> list[str]:
-        if not rows:
-            return []
+        if len(variation_rows) < 2:
+            return None
 
-        compact_rows = self._select_rows_for_insights(rows)
+        return ChartSpec(
+            chart_type="bar",
+            title="Variación porcentual",
+            x_label="Métrica",
+            y_label="Variación (%)",
+            series=[
+                ChartSeries(
+                    name="Variación %",
+                    data=[
+                        ChartPoint(x=row["label"], y=row["delta_pct"])
+                        for row in variation_rows
+                    ],
+                )
+            ],
+            reason="Muestra el cambio porcentual entre los dos periodos comparados.",
+        ).model_dump()
 
-        if not compact_rows:
-            return []
+    @staticmethod
+    def _generate_insights(rows: List[dict]) -> List[str]:
+        insights = []
 
-        try:
-            chain = self.insights_prompt | self.llm
+        sorted_rows = sorted(
+            [row for row in rows if row.get("delta_pct") is not None],
+            key=lambda row: abs(row["delta_pct"]),
+            reverse=True,
+        )
 
-            response = chain.invoke(
-                {
-                    "datos": json.dumps(
-                        compact_rows,
-                        ensure_ascii=False,
-                        indent=2,
-                    )
-                }
+        for row in sorted_rows[:5]:
+            direction = "aumentó" if row["delta_pct"] > 0 else "disminuyó"
+
+            insights.append(
+                f"{row['label']} {direction} {abs(row['delta_pct'])}% "
+                f"respecto al periodo anterior."
             )
 
-            return self._parse_insights_response(response.content)
-
-        except Exception:
-            return []
+        return insights
 
     @staticmethod
-    def _select_rows_for_insights(
-        rows: list[dict[str, Any]],
-        max_rows: int = 25,
-    ) -> list[dict[str, Any]]:
-        priority_labels = {
-            "Total net sales",
-            "Gross margin",
-            "Operating income",
-            "Net income",
-            "iPhone",
-            "Services",
-            "Americas",
-            "Europe",
-            "Greater China",
-            "Cash generated by operating activities",
-            "Cash used in financing activities",
-        }
+    def _generate_warnings(raw_rows: List[dict], clean_rows: List[dict]) -> List[str]:
+        warnings = []
 
-        selected = [
-            row for row in rows
-            if row["label"] in priority_labels
-        ]
+        discarded = len(raw_rows) - len(clean_rows)
 
-        if len(selected) < 5:
-            selected = rows[:max_rows]
+        if discarded > 0:
+            warnings.append(
+                f"Se descartaron {discarded} filas por inconsistencias numéricas o etiquetas no válidas."
+            )
 
-        return selected[:max_rows]
+        if not clean_rows:
+            warnings.append("No se encontraron datos financieros válidos para generar analítica.")
 
-    @staticmethod
-    def _parse_insights_response(content: str) -> list[str]:
-        if not content:
-            return []
-
-        lines = []
-
-        for raw_line in content.splitlines():
-            line = raw_line.strip()
-
-            if not line:
-                continue
-
-            line = re.sub(r"^\d+[\).\s-]+", "", line)
-            line = line.strip("-• ")
-
-            if line:
-                lines.append(line)
-
-        return lines[:6]
+        return warnings

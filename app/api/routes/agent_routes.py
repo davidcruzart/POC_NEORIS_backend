@@ -26,10 +26,16 @@ async def execute_agent_flow(
         raise HTTPException(status_code=400, detail="Formato de archivo no permitido.")
 
     try:
-        text = ingestion_service.extract_text(file)
+        file_bytes = await file.read()
+        text = ingestion_service.extract_text_from_bytes(
+            file_bytes=file_bytes,
+            filename=file.filename or "uploaded_file",
+        )
 
         initial_state = {
             "raw_text": text,
+            "file_bytes": file_bytes,
+            "filename": file.filename,
             "user_request": user_request,
             "percentage": percentage,
             "warnings": [],

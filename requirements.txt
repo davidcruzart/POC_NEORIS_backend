@@ -1,28 +1,16 @@
-# Core API
 fastapi
 uvicorn
-
-# Config
 python-dotenv
 python-multipart
-
-# LLM stack
 langchain
 langchain-openai
 langchain-community
 langchain-text-splitters
-
-# Agent / orchestration
 langgraph
-
-# File reading
-pymupdf        # PDF (PyMuPDFLoader)
-docx2txt       # DOCX
-python-docx    # export DOCX
-
-# Export
-reportlab      # PDF export
-
-# Utils / runtime
+pymupdf
+docx2txt
+python-docx
+reportlab
+markitdown
 tqdm
 numpy

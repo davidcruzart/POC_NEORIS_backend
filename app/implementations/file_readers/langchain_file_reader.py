@@ -1,7 +1,11 @@
 import os
 import tempfile
 
-from langchain_community.document_loaders import PyMuPDFLoader, TextLoader, Docx2txtLoader
+from langchain_community.document_loaders import (
+    Docx2txtLoader,
+    PyMuPDFLoader,
+    TextLoader,
+)
 
 from app.core.config import MAX_FILE_SIZE_BYTES
 from app.core.exceptions import (
@@ -14,8 +18,16 @@ from app.interfaces.file_reader import FileReader
 
 class LangchainFileReader(FileReader):
     def read(self, uploaded_file) -> str:
-        file_name = (uploaded_file.filename or "").lower()
+        filename = uploaded_file.filename or "uploaded_file"
         file_bytes = uploaded_file.file.read()
+
+        return self.read_from_bytes(
+            file_bytes=file_bytes,
+            filename=filename,
+        )
+
+    def read_from_bytes(self, file_bytes: bytes, filename: str) -> str:
+        file_name = (filename or "").lower()
 
         if len(file_bytes) > MAX_FILE_SIZE_BYTES:
             raise FileTooLargeError(

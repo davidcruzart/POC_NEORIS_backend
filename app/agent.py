@@ -9,6 +9,9 @@ from app.services.summary_service import SummaryService
 
 class AgentState(TypedDict, total=False):
     raw_text: str
+    file_bytes: Optional[bytes]
+    filename: Optional[str]
+
     user_request: Optional[str]
     percentage: int
 
@@ -73,6 +76,8 @@ class Agent:
             document_type
         )
 
+        state.setdefault("metadata", {})["document_classified"] = True
+
         return state
 
     def _classify_user_intent_node(self, state: dict) -> dict:
@@ -84,6 +89,8 @@ class Agent:
             user_intent
         )
 
+        state.setdefault("metadata", {})["intent_classified"] = True
+
         return state
 
     def _summarize_node(self, state: dict) -> dict:
@@ -94,16 +101,19 @@ class Agent:
 
         state["summary_result"] = result
 
-        state.setdefault("metadata", {}).update({
-            "executed_tool": "summarize",
-        })
+        state.setdefault("metadata", {}).update(
+            {
+                "executed_tool": "summarize",
+            }
+        )
 
         return state
 
     def _extract_analytics_node(self, state: dict) -> dict:
         result = self.analytics_service.analyze(
-            text=state["raw_text"],
+            raw_text=state["raw_text"],
             document_type=state["document_type"],
+            file_bytes=state.get("file_bytes"),
         )
 
         state["analytics_result"] = result
@@ -112,14 +122,16 @@ class Agent:
         if analytics_warnings:
             state.setdefault("warnings", []).extend(analytics_warnings)
 
-        state.setdefault("metadata", {}).update({
-            "executed_tool": "extract_analytics",
-            "analytics_generated": True,
-            "chart_specs_generated": result.get("metadata", {}).get(
-                "chart_specs_generated",
-                0,
-            ),
-        })
+        state.setdefault("metadata", {}).update(
+            {
+                "executed_tool": "extract_analytics",
+                "analytics_generated": True,
+                "chart_specs_generated": result.get("metadata", {}).get(
+                    "chart_specs_generated",
+                    0,
+                ),
+            }
+        )
 
         return state
 
