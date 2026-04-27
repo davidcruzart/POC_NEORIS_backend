@@ -14,7 +14,7 @@ Texto:
 """
 
 CHART_SUGGESTION_PROMPT = """
-A partir de los datos extraídos de un documento, propone gráficas útiles.
+A partir de los datos extraídos de un documento, propón gráficas útiles.
 
 Reglas:
 - no inventes datos

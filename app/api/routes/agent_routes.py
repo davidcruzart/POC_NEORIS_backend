@@ -1,3 +1,5 @@
+import traceback
+
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from app.api.dependencies import get_agent_service, get_ingestion_service
@@ -47,10 +49,13 @@ async def execute_agent_flow(
             errors=result.get("errors", []),
             metadata=result.get("metadata", {}),
         )
+
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     except Exception as exc:
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
-            detail="Error interno en el flujo agéntico.",
+            detail=f"Error interno en el flujo agéntico: {exc}",
         ) from exc
