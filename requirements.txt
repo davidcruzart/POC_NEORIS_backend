@@ -14,3 +14,7 @@ reportlab
 markitdown
 tqdm
 numpy
+chromadb
+langchain-chroma
+sentence-transformers
+scikit-learn

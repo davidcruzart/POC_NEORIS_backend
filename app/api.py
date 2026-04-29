@@ -1,5 +1,6 @@
 import json
 import traceback
+from functools import lru_cache
 from io import BytesIO
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
@@ -20,20 +21,23 @@ from app.schemas.summary import SummaryResponse
 from app.services.agent_service import AgentService
 from app.services.export_service import ExportService
 from app.services.ingestion_service import IngestionService
+from app.services.qa_service import QAService
 from app.services.summary_service import SummaryService
-
 
 router = APIRouter()
 
 
+@lru_cache
 def get_file_reader():
     return LangchainFileReader()
 
 
+@lru_cache
 def get_summarizer():
     return OpenAISummarizer()
 
 
+@lru_cache
 def get_exporters():
     return {
         "txt": TxtExporter(),
@@ -42,20 +46,88 @@ def get_exporters():
     }
 
 
+@lru_cache
 def get_ingestion_service():
     return IngestionService(file_reader=get_file_reader())
 
 
+@lru_cache
 def get_summary_service():
     return SummaryService(summarizer=get_summarizer())
 
 
+@lru_cache
 def get_export_service():
     return ExportService(exporters=get_exporters())
 
 
+@lru_cache
 def get_agent_service():
     return AgentService()
+
+
+@lru_cache
+def get_qa_service():
+    return QAService()
+
+
+def validate_input_filename(filename: str | None, field_name: str = "archivo") -> str:
+    normalized = (filename or "").lower()
+
+    if not normalized.endswith(ALLOWED_INPUT_EXTENSIONS):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Formato de {field_name} no permitido.",
+        )
+
+    return filename or "uploaded_file"
+
+
+def parse_chat_history(chat_history: str | None) -> list:
+    if not chat_history:
+        return []
+
+    try:
+        parsed = json.loads(chat_history)
+
+        if isinstance(parsed, list):
+            return parsed
+
+        return []
+
+    except json.JSONDecodeError:
+        return []
+
+
+async def read_and_extract_file(
+    file: UploadFile,
+    ingestion_service: IngestionService,
+    field_name: str = "archivo",
+) -> tuple[bytes, str, str]:
+    filename = validate_input_filename(file.filename, field_name=field_name)
+    file_bytes = await file.read()
+
+    text = ingestion_service.extract_text_from_bytes(
+        file_bytes=file_bytes,
+        filename=filename,
+    )
+
+    return file_bytes, text, filename
+
+
+def build_agent_response(result: dict) -> AgentResponse:
+    return AgentResponse(
+        document_type=result["document_type"],
+        user_intent=result["user_intent"],
+        status="completed",
+        summary_result=result.get("summary_result"),
+        analytics_result=result.get("analytics_result"),
+        comparison_result=result.get("comparison_result"),
+        qa_result=result.get("qa_result"),
+        warnings=result.get("warnings", []),
+        errors=result.get("errors", []),
+        metadata=result.get("metadata", {}),
+    )
 
 
 @router.post("/summary", response_model=SummaryResponse, tags=["summary"])
@@ -65,18 +137,17 @@ async def summarize_document(
     ingestion_service: IngestionService = Depends(get_ingestion_service),
     summary_service: SummaryService = Depends(get_summary_service),
 ):
-    filename = (file.filename or "").lower()
-
-    if not filename.endswith(ALLOWED_INPUT_EXTENSIONS):
-        raise HTTPException(status_code=400, detail="Formato de archivo no permitido.")
-
     try:
+        validate_input_filename(file.filename)
         text = ingestion_service.extract_text(file)
         result = summary_service.summarize_text(text=text, percentage=percentage)
         return SummaryResponse(**result)
 
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    except HTTPException:
+        raise
 
     except Exception as exc:
         raise HTTPException(
@@ -91,7 +162,9 @@ async def export_summary(
     output_format: str = Form(...),
     export_service: ExportService = Depends(get_export_service),
 ):
-    if output_format.lower() not in ALLOWED_OUTPUT_FORMATS:
+    output_format = output_format.lower()
+
+    if output_format not in ALLOWED_OUTPUT_FORMATS:
         raise HTTPException(status_code=400, detail="Formato de salida no soportado.")
 
     try:
@@ -125,28 +198,11 @@ async def execute_agent_flow(
     ingestion_service: IngestionService = Depends(get_ingestion_service),
     agent_service: AgentService = Depends(get_agent_service),
 ):
-    filename = (file.filename or "").lower()
-
-    if not filename.endswith(ALLOWED_INPUT_EXTENSIONS):
-        raise HTTPException(status_code=400, detail="Formato de archivo no permitido.")
-
     try:
-        parsed_chat_history = []
-
-        if chat_history:
-            try:
-                parsed_chat_history = json.loads(chat_history)
-
-                if not isinstance(parsed_chat_history, list):
-                    parsed_chat_history = []
-
-            except json.JSONDecodeError:
-                parsed_chat_history = []
-
-        file_bytes = await file.read()
-        text = ingestion_service.extract_text_from_bytes(
-            file_bytes=file_bytes,
-            filename=file.filename or "uploaded_file",
+        file_bytes, text, filename = await read_and_extract_file(
+            file=file,
+            ingestion_service=ingestion_service,
+            field_name="archivo principal",
         )
 
         second_raw_text = None
@@ -154,49 +210,94 @@ async def execute_agent_flow(
         second_filename = None
 
         if second_file is not None and second_file.filename:
-            second_filename_value = (second_file.filename or "").lower()
-
-            if not second_filename_value.endswith(ALLOWED_INPUT_EXTENSIONS):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Formato del segundo archivo no permitido.",
-                )
-
-            second_file_bytes = await second_file.read()
-            second_raw_text = ingestion_service.extract_text_from_bytes(
-                file_bytes=second_file_bytes,
-                filename=second_file.filename or "second_uploaded_file",
+            second_file_bytes, second_raw_text, second_filename = await read_and_extract_file(
+                file=second_file,
+                ingestion_service=ingestion_service,
+                field_name="segundo archivo",
             )
-            second_filename = second_file.filename
 
         initial_state = {
             "raw_text": text,
             "file_bytes": file_bytes,
-            "filename": file.filename,
+            "filename": filename,
             "second_raw_text": second_raw_text,
             "second_file_bytes": second_file_bytes,
             "second_filename": second_filename,
             "user_request": user_request,
             "percentage": percentage,
-            "chat_history": parsed_chat_history,
+            "chat_history": parse_chat_history(chat_history),
             "warnings": [],
             "errors": [],
             "metadata": {},
         }
 
         result = agent_service.run_flow(initial_state)
+        return build_agent_response(result)
 
-        return AgentResponse(
-            document_type=result["document_type"],
-            user_intent=result["user_intent"],
-            status="completed",
-            summary_result=result.get("summary_result"),
-            analytics_result=result.get("analytics_result"),
-            comparison_result=result.get("comparison_result"),
-            qa_result=result.get("qa_result"),
-            warnings=result.get("warnings", []),
-            errors=result.get("errors", []),
-            metadata=result.get("metadata", {}),
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error interno en el flujo agéntico: {exc}",
+        ) from exc
+
+
+@router.post("/qa/index", tags=["qa"])
+async def index_qa_document(
+    file: UploadFile = File(...),
+    ingestion_service: IngestionService = Depends(get_ingestion_service),
+    qa_service: QAService = Depends(get_qa_service),
+):
+    try:
+        _, text, filename = await read_and_extract_file(
+            file=file,
+            ingestion_service=ingestion_service,
+            field_name="archivo QA",
+        )
+
+        result = qa_service.index_document(
+            text=text,
+            filename=filename,
+        )
+
+        if not result.get("document_id"):
+            raise HTTPException(
+                status_code=400,
+                detail=result.get("message", "No se pudo indexar el documento."),
+            )
+
+        return result
+
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error interno indexando documento QA: {exc}",
+        ) from exc
+
+
+@router.post("/qa/ask", tags=["qa"])
+async def ask_qa_document(
+    document_id: str = Form(...),
+    question: str = Form(...),
+    qa_service: QAService = Depends(get_qa_service),
+):
+    try:
+        return qa_service.answer_question_by_document_id(
+            document_id=document_id,
+            question=question,
         )
 
     except ValueError as exc:
@@ -206,5 +307,5 @@ async def execute_agent_flow(
         traceback.print_exc()
         raise HTTPException(
             status_code=500,
-            detail=f"Error interno en el flujo agéntico: {exc}",
+            detail=f"Error interno respondiendo QA: {exc}",
         ) from exc
