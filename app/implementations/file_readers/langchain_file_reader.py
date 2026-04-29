@@ -39,7 +39,7 @@ class LangchainFileReader(FileReader):
         if file_name.endswith(".pdf"):
             suffix = ".pdf"
             loader_class = PyMuPDFLoader
-        elif file_name.endswith(".txt"):
+        elif file_name.endswith((".txt", ".md")):
             suffix = ".txt"
             loader_class = TextLoader
         elif file_name.endswith(".csv"):  # <--- AÑADIR ESTE BLOQUE
@@ -60,7 +60,7 @@ class LangchainFileReader(FileReader):
                 temp_file.write(file_bytes)
                 temp_path = temp_file.name
 
-            if suffix == ".txt":
+            if suffix in [".txt", ".md"]:
                 loader = loader_class(temp_path, encoding="utf-8")
             else:
                 loader = loader_class(temp_path)

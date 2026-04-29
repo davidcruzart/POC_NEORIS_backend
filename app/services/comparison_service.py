@@ -1,10 +1,24 @@
-import json
+import logging
 from typing import Any
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
 
 from app.config import DEFAULT_MODEL_NAME
+from app.prompts.comparison_prompts import DOCUMENT_COMPARISON_PROMPT
+
+logger = logging.getLogger(__name__)
+
+
+class ComparisonExtraction(BaseModel):
+    document_a_summary: str | None = None
+    document_b_summary: str | None = None
+    document_a_keywords: list[str] = Field(default_factory=list)
+    document_b_keywords: list[str] = Field(default_factory=list)
+    similarities: list[str] = Field(default_factory=list)
+    differences: list[str] = Field(default_factory=list)
+    comparison_summary: str | None = None
 
 
 class ComparisonService:
@@ -12,65 +26,10 @@ class ComparisonService:
         self.llm = ChatOpenAI(
             model=DEFAULT_MODEL_NAME,
             temperature=0,
-        )
+        ).with_structured_output(ComparisonExtraction)
 
-        self.keyword_prompt = ChatPromptTemplate.from_template(
-            """
-Extrae entre 8 y 15 palabras clave o conceptos principales del siguiente documento.
-
-Reglas:
-- Devuelve solo una lista JSON de strings.
-- No expliques nada.
-- No inventes conceptos que no estén en el texto.
-
-Documento:
-{texto}
-"""
-        )
-
-        self.summary_prompt = ChatPromptTemplate.from_template(
-            """
-Resume brevemente el siguiente documento para poder compararlo con otro.
-
-Reglas:
-- Máximo 250 palabras.
-- Mantén datos, temas y conclusiones importantes.
-- No inventes información.
-
-Documento:
-{texto}
-"""
-        )
-
-        self.comparison_prompt = ChatPromptTemplate.from_template(
-            """
-Compara los dos documentos usando sus resúmenes y palabras clave.
-
-Documento A - resumen:
-{summary_a}
-
-Documento A - keywords:
-{keywords_a}
-
-Documento B - resumen:
-{summary_b}
-
-Documento B - keywords:
-{keywords_b}
-
-Devuelve un JSON válido con esta estructura exacta:
-
-{{
-  "similarities": ["..."],
-  "differences": ["..."],
-  "comparison_summary": "..."
-}}
-
-Reglas:
-- No inventes información.
-- Si algo no está claro, indícalo de forma prudente.
-- Las similitudes y diferencias deben ser concretas.
-"""
+        self.prompt = ChatPromptTemplate.from_template(
+            DOCUMENT_COMPARISON_PROMPT
         )
 
     def compare_documents(
@@ -78,105 +37,96 @@ Reglas:
         text_a: str,
         text_b: str,
         user_request: str | None = None,
+        filename_a: str | None = None,
+        filename_b: str | None = None,
     ) -> dict[str, Any]:
-        summary_a = self._summarize_for_comparison(text_a)
-        summary_b = self._summarize_for_comparison(text_b)
+        text_a = str(text_a or "").strip()
+        text_b = str(text_b or "").strip()
+        user_request = str(user_request or "Compara estos dos documentos.").strip()
 
-        keywords_a = self._extract_keywords(text_a)
-        keywords_b = self._extract_keywords(text_b)
+        warnings: list[str] = []
 
-        comparison_payload = self._compare(
-            summary_a=summary_a,
-            summary_b=summary_b,
-            keywords_a=keywords_a,
-            keywords_b=keywords_b,
-        )
+        if not text_a:
+            return self._empty_result(
+                warnings=["El documento A no contiene texto extraído."],
+                filename_a=filename_a,
+                filename_b=filename_b,
+            )
 
-        return {
-            "document_a_summary": summary_a,
-            "document_b_summary": summary_b,
-            "document_a_keywords": keywords_a,
-            "document_b_keywords": keywords_b,
-            "similarities": comparison_payload.get("similarities", []),
-            "differences": comparison_payload.get("differences", []),
-            "comparison_summary": comparison_payload.get("comparison_summary"),
-            "metadata": {
-                "user_request": user_request,
-                "document_a_chars": len(text_a),
-                "document_b_chars": len(text_b),
-            },
-        }
-
-    def _summarize_for_comparison(self, text: str) -> str:
-        excerpt = self._build_excerpt(text, max_chars=20_000)
-        chain = self.summary_prompt | self.llm
-        response = chain.invoke({"texto": excerpt})
-        return str(response.content).strip()
-
-    def _extract_keywords(self, text: str) -> list[str]:
-        excerpt = self._build_excerpt(text, max_chars=20_000)
-        chain = self.keyword_prompt | self.llm
-        response = chain.invoke({"texto": excerpt})
-
-        content = str(response.content).strip()
+        if not text_b:
+            return self._empty_result(
+                warnings=["El documento B no contiene texto extraído."],
+                filename_a=filename_a,
+                filename_b=filename_b,
+            )
 
         try:
-            parsed = json.loads(content)
-            if isinstance(parsed, list):
-                return [str(item).strip() for item in parsed if str(item).strip()]
-        except json.JSONDecodeError:
-            pass
+            chain = self.prompt | self.llm
 
-        return [
-            item.strip(" -•\t")
-            for item in content.splitlines()
-            if item.strip(" -•\t")
-        ][:15]
+            result = chain.invoke(
+                {
+                    "document_a": text_a[:60_000],
+                    "document_b": text_b[:60_000],
+                    "user_request": user_request,
+                }
+            )
 
-    def _compare(
-        self,
-        summary_a: str,
-        summary_b: str,
-        keywords_a: list[str],
-        keywords_b: list[str],
-    ) -> dict[str, Any]:
-        chain = self.comparison_prompt | self.llm
-        response = chain.invoke(
-            {
-                "summary_a": summary_a,
-                "summary_b": summary_b,
-                "keywords_a": ", ".join(keywords_a),
-                "keywords_b": ", ".join(keywords_b),
+            return {
+                "document_a_summary": result.document_a_summary,
+                "document_b_summary": result.document_b_summary,
+                "document_a_keywords": self._clean_list(result.document_a_keywords),
+                "document_b_keywords": self._clean_list(result.document_b_keywords),
+                "similarities": self._clean_list(result.similarities),
+                "differences": self._clean_list(result.differences),
+                "comparison_summary": result.comparison_summary,
+                "metadata": {
+                    "method": "structured_llm_document_comparison",
+                    "filename_a": filename_a,
+                    "filename_b": filename_b,
+                    "document_a_chars_used": min(len(text_a), 60_000),
+                    "document_b_chars_used": min(len(text_b), 60_000),
+                },
             }
-        )
 
-        content = str(response.content).strip()
+        except Exception as exc:
+            logger.error("Error comparando documentos: %s", exc)
 
-        try:
-            parsed = json.loads(content)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-
-        return {
-            "similarities": [],
-            "differences": [],
-            "comparison_summary": content,
-        }
+            return self._empty_result(
+                warnings=[f"No se pudo generar la comparación: {exc}"],
+                filename_a=filename_a,
+                filename_b=filename_b,
+            )
 
     @staticmethod
-    def _build_excerpt(text: str, max_chars: int) -> str:
-        clean_text = (text or "").strip()
+    def _clean_list(items: list[str]) -> list[str]:
+        cleaned = []
 
-        if len(clean_text) <= max_chars:
-            return clean_text
+        for item in items or []:
+            value = str(item).strip()
 
-        head_size = max_chars // 2
-        tail_size = max_chars - head_size
+            if value:
+                cleaned.append(value)
 
-        return (
-            clean_text[:head_size]
-            + "\n\n[... CONTENIDO INTERMEDIO OMITIDO ...]\n\n"
-            + clean_text[-tail_size:]
-        )
+        return cleaned
+
+    @staticmethod
+    def _empty_result(
+        warnings: list[str],
+        filename_a: str | None = None,
+        filename_b: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "document_a_summary": None,
+            "document_b_summary": None,
+            "document_a_keywords": [],
+            "document_b_keywords": [],
+            "similarities": [],
+            "differences": [],
+            "comparison_summary": None,
+            "metadata": {
+                "method": "structured_llm_document_comparison",
+                "filename_a": filename_a,
+                "filename_b": filename_b,
+                "warnings": warnings,
+            },
+        }

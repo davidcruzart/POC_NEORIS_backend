@@ -137,11 +137,13 @@ class Agent:
             raw_text=state["raw_text"],
             document_type=state["document_type"],
             file_bytes=state.get("file_bytes"),
+            filename=state.get("filename"),
         )
 
         state["analytics_result"] = result
 
         analytics_warnings = result.get("warnings", [])
+
         if analytics_warnings:
             state.setdefault("warnings", []).extend(analytics_warnings)
 
@@ -149,8 +151,12 @@ class Agent:
             {
                 "executed_tool": "extract_analytics",
                 "analytics_generated": True,
-                "chart_specs_generated": result.get("metadata", {}).get(
-                    "chart_specs_generated",
+                "charts_generated": result.get("metadata", {}).get(
+                    "charts_generated",
+                    0,
+                ),
+                "metrics_detected": result.get("metadata", {}).get(
+                    "metrics_detected",
                     0,
                 ),
             }
@@ -177,9 +183,16 @@ class Agent:
             text_a=state["raw_text"],
             text_b=second_raw_text,
             user_request=state.get("user_request"),
+            filename_a=state.get("filename"),
+            filename_b=state.get("second_filename"),
         )
 
         state["comparison_result"] = result
+
+        comparison_warnings = result.get("metadata", {}).get("warnings", [])
+
+        if comparison_warnings:
+            state.setdefault("warnings", []).extend(comparison_warnings)
 
         state.setdefault("metadata", {}).update(
             {
