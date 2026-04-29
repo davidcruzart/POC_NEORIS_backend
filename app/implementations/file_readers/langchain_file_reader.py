@@ -5,10 +5,11 @@ from langchain_community.document_loaders import (
     Docx2txtLoader,
     PyMuPDFLoader,
     TextLoader,
+    CSVLoader
 )
 
-from app.core.config import MAX_FILE_SIZE_BYTES
-from app.core.exceptions import (
+from app.config import MAX_FILE_SIZE_BYTES
+from app.exceptions import (
     EmptyExtractedTextError,
     FileTooLargeError,
     UnsupportedFileTypeError,
@@ -41,6 +42,9 @@ class LangchainFileReader(FileReader):
         elif file_name.endswith(".txt"):
             suffix = ".txt"
             loader_class = TextLoader
+        elif file_name.endswith(".csv"):  # <--- AÑADIR ESTE BLOQUE
+            suffix = ".csv"
+            loader_class = CSVLoader
         elif file_name.endswith(".docx"):
             suffix = ".docx"
             loader_class = Docx2txtLoader

@@ -4,7 +4,7 @@ import numpy as np
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from app.core.config import CHUNK_OVERLAP, CHUNK_SIZE, DEFAULT_MODEL_NAME
+from app.config import CHUNK_OVERLAP, CHUNK_SIZE, DEFAULT_MODEL_NAME
 
 
 class QAService:

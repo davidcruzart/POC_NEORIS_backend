@@ -1,7 +1,11 @@
 from io import BytesIO
+from xml.sax.saxutils import escape
 
+from reportlab.lib.enums import TA_LEFT
 from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
 from app.interfaces.exporter import Exporter
 
@@ -9,53 +13,75 @@ from app.interfaces.exporter import Exporter
 class PdfExporter(Exporter):
     def export(self, text: str) -> bytes:
         buffer = BytesIO()
-        pdf = canvas.Canvas(buffer, pagesize=A4)
 
-        width, height = A4
-        x = 50
-        y = height - 50
-        max_width = width - 100
+        document = SimpleDocTemplate(
+            buffer,
+            pagesize=A4,
+            rightMargin=2 * cm,
+            leftMargin=2 * cm,
+            topMargin=2 * cm,
+            bottomMargin=2 * cm,
+            title="Resumen generado",
+            author="Agentic Document Processor",
+            subject="Resumen exportado",
+        )
 
-        pdf.setFont("Helvetica-Bold", 14)
-        pdf.drawString(x, y, "Resumen generado")
-        y -= 30
+        styles = getSampleStyleSheet()
 
-        pdf.setFont("Helvetica", 11)
+        title_style = ParagraphStyle(
+            name="CustomTitle",
+            parent=styles["Title"],
+            fontName="Helvetica-Bold",
+            fontSize=16,
+            leading=20,
+            alignment=TA_LEFT,
+            spaceAfter=18,
+        )
 
-        for line in text.split("\n"):
-            if not line.strip():
-                y -= 10
+        body_style = ParagraphStyle(
+            name="CustomBody",
+            parent=styles["BodyText"],
+            fontName="Helvetica",
+            fontSize=10,
+            leading=14,
+            alignment=TA_LEFT,
+            spaceAfter=8,
+        )
+
+        story = [
+            Paragraph("Resumen generado", title_style),
+            Spacer(1, 0.3 * cm),
+        ]
+
+        clean_text = self._sanitize_text(text)
+
+        for paragraph in clean_text.split("\n"):
+            paragraph = paragraph.strip()
+
+            if not paragraph:
+                story.append(Spacer(1, 0.25 * cm))
                 continue
 
-            words = line.split()
-            current_line = ""
+            story.append(
+                Paragraph(
+                    escape(paragraph),
+                    body_style,
+                )
+            )
 
-            for word in words:
-                candidate = f"{current_line} {word}".strip()
+        document.build(story)
 
-                if pdf.stringWidth(candidate, "Helvetica", 11) < max_width:
-                    current_line = candidate
-                else:
-                    pdf.drawString(x, y, current_line)
-                    y -= 18
-                    current_line = word
-
-                    if y < 50:
-                        pdf.showPage()
-                        pdf.setFont("Helvetica", 11)
-                        y = height - 50
-
-            if current_line:
-                pdf.drawString(x, y, current_line)
-                y -= 18
-
-                if y < 50:
-                    pdf.showPage()
-                    pdf.setFont("Helvetica", 11)
-                    y = height - 50
-
-            y -= 8
-
-        pdf.save()
         buffer.seek(0)
         return buffer.getvalue()
+
+    @staticmethod
+    def _sanitize_text(text: str) -> str:
+        if not text:
+            return ""
+
+        return (
+            text.replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .replace("\t", " ")
+            .strip()
+        )

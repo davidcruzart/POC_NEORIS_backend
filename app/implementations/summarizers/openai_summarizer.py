@@ -5,7 +5,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from app.core.config import (
+from app.config import (
     CHUNK_OVERLAP,
     CHUNK_SIZE,
     DEFAULT_MODEL_NAME,
@@ -15,7 +15,7 @@ from app.core.config import (
     MAX_SUMMARY_WORKERS,
     MAX_TEXT_LENGTH_CHARS,
 )
-from app.core.exceptions import EmptyExtractedTextError, TextTooLargeError, TooManyFragmentsError
+from app.exceptions import EmptyExtractedTextError, TextTooLargeError, TooManyFragmentsError
 from app.interfaces.summarizer import Summarizer
 from app.prompts.summary_prompts import (
     DIRECT_SUMMARY_PROMPT,

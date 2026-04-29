@@ -1,4 +1,4 @@
-from app.core.exceptions import UnsupportedOutputFormatError
+from app.exceptions import UnsupportedOutputFormatError
 
 
 class ExportService:

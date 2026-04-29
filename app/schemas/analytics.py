@@ -11,8 +11,8 @@ class AnalyticsMetric(BaseModel):
 
 
 class FinancialRow(BaseModel):
-    statement: str
-    section: str
+    statement: str = "other"
+    section: str = "other"
     label: str
 
     period_1: str | None = None
@@ -40,8 +40,8 @@ class ChartSeries(BaseModel):
 class ChartSpec(BaseModel):
     chart_type: str
     title: str
-    x_label: str
-    y_label: str
+    x_label: str = ""
+    y_label: str = ""
     series: list[ChartSeries] = Field(default_factory=list)
     reason: str | None = None
 
@@ -58,3 +58,18 @@ class AnalyticsResult(BaseModel):
 
     warnings: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+class FinancialMetric(BaseModel):
+    label: str = Field(description="Nombre de la métrica")
+    value_current: float = Field(description="Valor actual o principal")
+    value_previous: float | None = Field(default=None, description="Valor anterior (opcional)")
+    unit: str = Field(default="")
+    category: str = Field(default="other")
+    period_current: str | None = None
+    period_previous: str | None = None
+
+class AnalyticsExtraction(BaseModel):
+    metrics: list[FinancialMetric] = Field(default_factory=list)
+
+class AnalyticsInsights(BaseModel):
+    insights: list[str] = Field(default_factory=list)

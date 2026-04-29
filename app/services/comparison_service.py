@@ -4,7 +4,7 @@ from typing import Any
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
-from app.core.config import DEFAULT_MODEL_NAME
+from app.config import DEFAULT_MODEL_NAME
 
 
 class ComparisonService:

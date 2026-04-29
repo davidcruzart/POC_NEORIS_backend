@@ -1,8 +1,8 @@
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
-from app.core.config import DEFAULT_MODEL_NAME, DEFAULT_MODEL_TEMPERATURE
-from app.core.constants import DOCUMENT_TYPES, USER_INTENTS
+from app.config import DEFAULT_MODEL_NAME, DEFAULT_MODEL_TEMPERATURE
+from app.config import DOCUMENT_TYPES, USER_INTENTS
 from app.prompts.classification_prompts import (
     DOCUMENT_CLASSIFICATION_PROMPT,
     INTENT_CLASSIFICATION_PROMPT,

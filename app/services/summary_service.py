@@ -1,5 +1,5 @@
-from app.core.config import MAX_TARGET_WORDS, MAX_SUMMARY_PERCENTAGE, MIN_SUMMARY_PERCENTAGE
-from app.core.exceptions import InvalidPercentageError
+from app.config import MAX_TARGET_WORDS, MAX_SUMMARY_PERCENTAGE, MIN_SUMMARY_PERCENTAGE
+from app.exceptions import InvalidPercentageError
 from app.interfaces.summarizer import Summarizer
 
 
