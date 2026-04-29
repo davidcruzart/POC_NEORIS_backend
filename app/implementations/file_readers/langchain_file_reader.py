@@ -42,7 +42,7 @@ class LangchainFileReader(FileReader):
         elif file_name.endswith((".txt", ".md")):
             suffix = ".txt"
             loader_class = TextLoader
-        elif file_name.endswith(".csv"):  # <--- AÑADIR ESTE BLOQUE
+        elif file_name.endswith(".csv"):
             suffix = ".csv"
             loader_class = CSVLoader
         elif file_name.endswith(".docx"):
