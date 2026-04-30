@@ -2,7 +2,6 @@ from typing import Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
 
-from app.implementations.summarizers.openai_summarizer import OpenAISummarizer
 from app.services.analytics_service import AnalyticsService
 from app.services.classification_service import ClassificationService
 from app.services.comparison_service import ComparisonService
@@ -19,9 +18,10 @@ class AgentState(TypedDict, total=False):
     second_file_bytes: Optional[bytes]
     second_filename: Optional[str]
 
+    document_id: Optional[str]
+
     user_request: Optional[str]
     percentage: int
-    chat_history: List[Dict[str, Any]]
 
     document_type: str
     user_intent: str
@@ -30,57 +30,29 @@ class AgentState(TypedDict, total=False):
     analytics_result: Dict[str, Any]
     comparison_result: Dict[str, Any]
     qa_result: Dict[str, Any]
+    qa_index_result: Dict[str, Any]
 
+    chat_history: List[Dict[str, Any]]
     warnings: List[str]
     errors: List[str]
     metadata: Dict[str, Any]
 
 
 class Agent:
-    def __init__(self):
-        self._classification_service: ClassificationService | None = None
-        self._summary_service: SummaryService | None = None
-        self._analytics_service: AnalyticsService | None = None
-        self._comparison_service: ComparisonService | None = None
-        self._qa_service: QAService | None = None
-
+    def __init__(
+        self,
+        summary_service: SummaryService,
+        classification_service: ClassificationService,
+        analytics_service: AnalyticsService,
+        comparison_service: ComparisonService,
+        qa_service: QAService,
+    ):
+        self.summary_service = summary_service
+        self.classification_service = classification_service
+        self.analytics_service = analytics_service
+        self.comparison_service = comparison_service
+        self.qa_service = qa_service
         self.graph = self._build_graph()
-
-    @property
-    def classification_service(self) -> ClassificationService:
-        if self._classification_service is None:
-            self._classification_service = ClassificationService()
-
-        return self._classification_service
-
-    @property
-    def summary_service(self) -> SummaryService:
-        if self._summary_service is None:
-            summarizer = OpenAISummarizer()
-            self._summary_service = SummaryService(summarizer=summarizer)
-
-        return self._summary_service
-
-    @property
-    def analytics_service(self) -> AnalyticsService:
-        if self._analytics_service is None:
-            self._analytics_service = AnalyticsService()
-
-        return self._analytics_service
-
-    @property
-    def comparison_service(self) -> ComparisonService:
-        if self._comparison_service is None:
-            self._comparison_service = ComparisonService()
-
-        return self._comparison_service
-
-    @property
-    def qa_service(self) -> QAService:
-        if self._qa_service is None:
-            self._qa_service = QAService()
-
-        return self._qa_service
 
     def run(self, initial_state: dict) -> dict:
         return self.graph.invoke(initial_state)
@@ -88,14 +60,27 @@ class Agent:
     def _build_graph(self):
         builder = StateGraph(AgentState)
 
+        builder.add_node("prepare_request", self._prepare_request_node)
         builder.add_node("classify_document", self._classify_document_node)
         builder.add_node("classify_user_intent", self._classify_user_intent_node)
+
         builder.add_node("summarize", self._summarize_node)
         builder.add_node("extract_analytics", self._extract_analytics_node)
         builder.add_node("compare_documents", self._compare_documents_node)
         builder.add_node("qa_rag", self._qa_rag_node)
+        builder.add_node("qa_index", self._qa_index_node)
+        builder.add_node("qa_ask", self._qa_ask_node)
 
-        builder.set_entry_point("classify_document")
+        builder.set_entry_point("prepare_request")
+
+        builder.add_conditional_edges(
+            "prepare_request",
+            self._route_from_prepare,
+            {
+                "classify_document": "classify_document",
+                "qa_ask": "qa_ask",
+            },
+        )
 
         builder.add_edge("classify_document", "classify_user_intent")
 
@@ -107,6 +92,8 @@ class Agent:
                 "extract_analytics": "extract_analytics",
                 "compare_documents": "compare_documents",
                 "qa_rag": "qa_rag",
+                "qa_index": "qa_index",
+                "qa_ask": "qa_ask",
             },
         )
 
@@ -114,13 +101,37 @@ class Agent:
         builder.add_edge("extract_analytics", END)
         builder.add_edge("compare_documents", END)
         builder.add_edge("qa_rag", END)
+        builder.add_edge("qa_index", END)
+        builder.add_edge("qa_ask", END)
 
         return builder.compile()
 
+    def _prepare_request_node(self, state: dict) -> dict:
+        state.setdefault("warnings", [])
+        state.setdefault("errors", [])
+        state.setdefault("metadata", {})
+        state.setdefault("chat_history", [])
+
+        state["metadata"]["graph_started"] = True
+
+        return state
+
+    @staticmethod
+    def _route_from_prepare(state: dict) -> str:
+        if state.get("user_intent") == "qa_ask":
+            return "qa_ask"
+
+        return "classify_document"
+
     def _classify_document_node(self, state: dict) -> dict:
-        document_type = self.classification_service.classify_document(
-            state["raw_text"]
-        )
+        raw_text = state.get("raw_text", "")
+
+        if not raw_text:
+            state["document_type"] = "generic"
+            state.setdefault("metadata", {})["document_classified"] = False
+            return state
+
+        document_type = self.classification_service.classify_document(raw_text)
 
         state["document_type"] = self.classification_service.validate_document_type(
             document_type
@@ -131,6 +142,23 @@ class Agent:
         return state
 
     def _classify_user_intent_node(self, state: dict) -> dict:
+        explicit_intent = state.get("user_intent")
+
+        allowed_explicit_intents = {
+            "summarize",
+            "extract_analytics",
+            "compare_documents",
+            "qa_rag",
+            "qa_index",
+            "qa_ask",
+        }
+
+        if explicit_intent in allowed_explicit_intents:
+            state["user_intent"] = explicit_intent
+            state.setdefault("metadata", {})["intent_classified"] = False
+            state.setdefault("metadata", {})["intent_source"] = "explicit"
+            return state
+
         user_intent = self.classification_service.classify_user_intent(
             state.get("user_request")
         )
@@ -140,6 +168,7 @@ class Agent:
         )
 
         state.setdefault("metadata", {})["intent_classified"] = True
+        state.setdefault("metadata", {})["intent_source"] = "classifier"
 
         return state
 
@@ -203,14 +232,12 @@ class Agent:
             state.setdefault("errors", []).append(
                 "La comparación requiere un segundo documento."
             )
-
             state.setdefault("metadata", {}).update(
                 {
                     "executed_tool": "compare_documents",
                     "comparison_generated": False,
                 }
             )
-
             return state
 
         result = self.comparison_service.compare_documents(
@@ -251,6 +278,53 @@ class Agent:
             {
                 "executed_tool": "qa_rag",
                 "qa_generated": True,
+                "qa_mode": "single_shot_rag",
+            }
+        )
+
+        return state
+
+    def _qa_index_node(self, state: dict) -> dict:
+        result = self.qa_service.index_document(
+            text=state.get("raw_text", ""),
+            filename=state.get("filename"),
+        )
+
+        state["qa_index_result"] = result
+
+        if not result.get("document_id"):
+            state.setdefault("errors", []).append(
+                result.get("message", "No se pudo indexar el documento.")
+            )
+
+        state.setdefault("metadata", {}).update(
+            {
+                "executed_tool": "qa_index",
+                "qa_indexed": bool(result.get("document_id")),
+                "document_id": result.get("document_id"),
+                "chunks_indexed": result.get("chunks_indexed", 0),
+            }
+        )
+
+        return state
+
+    def _qa_ask_node(self, state: dict) -> dict:
+        question = state.get("user_request") or ""
+        document_id = state.get("document_id") or ""
+
+        result = self.qa_service.answer_question_by_document_id(
+            document_id=document_id,
+            question=question,
+        )
+
+        state["qa_result"] = result
+
+        state.setdefault("metadata", {}).update(
+            {
+                "executed_tool": "qa_ask",
+                "qa_generated": True,
+                "qa_mode": "indexed_chat_rag",
+                "document_id": document_id,
             }
         )
 
@@ -268,5 +342,11 @@ class Agent:
 
         if user_intent == "qa_rag":
             return "qa_rag"
+
+        if user_intent == "qa_index":
+            return "qa_index"
+
+        if user_intent == "qa_ask":
+            return "qa_ask"
 
         return "summarize"
