@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
 
+from app.implementations.summarizers.openai_summarizer import OpenAISummarizer
 from app.services.analytics_service import AnalyticsService
 from app.services.classification_service import ClassificationService
 from app.services.comparison_service import ComparisonService
@@ -20,6 +21,7 @@ class AgentState(TypedDict, total=False):
 
     user_request: Optional[str]
     percentage: int
+    chat_history: List[Dict[str, Any]]
 
     document_type: str
     user_intent: str
@@ -35,20 +37,50 @@ class AgentState(TypedDict, total=False):
 
 
 class Agent:
-    def __init__(
-        self,
-        summary_service: SummaryService,
-        classification_service: ClassificationService,
-        analytics_service: AnalyticsService,
-        comparison_service: ComparisonService,
-        qa_service: QAService,
-    ):
-        self.summary_service = summary_service
-        self.classification_service = classification_service
-        self.analytics_service = analytics_service
-        self.comparison_service = comparison_service
-        self.qa_service = qa_service
+    def __init__(self):
+        self._classification_service: ClassificationService | None = None
+        self._summary_service: SummaryService | None = None
+        self._analytics_service: AnalyticsService | None = None
+        self._comparison_service: ComparisonService | None = None
+        self._qa_service: QAService | None = None
+
         self.graph = self._build_graph()
+
+    @property
+    def classification_service(self) -> ClassificationService:
+        if self._classification_service is None:
+            self._classification_service = ClassificationService()
+
+        return self._classification_service
+
+    @property
+    def summary_service(self) -> SummaryService:
+        if self._summary_service is None:
+            summarizer = OpenAISummarizer()
+            self._summary_service = SummaryService(summarizer=summarizer)
+
+        return self._summary_service
+
+    @property
+    def analytics_service(self) -> AnalyticsService:
+        if self._analytics_service is None:
+            self._analytics_service = AnalyticsService()
+
+        return self._analytics_service
+
+    @property
+    def comparison_service(self) -> ComparisonService:
+        if self._comparison_service is None:
+            self._comparison_service = ComparisonService()
+
+        return self._comparison_service
+
+    @property
+    def qa_service(self) -> QAService:
+        if self._qa_service is None:
+            self._qa_service = QAService()
+
+        return self._qa_service
 
     def run(self, initial_state: dict) -> dict:
         return self.graph.invoke(initial_state)
@@ -171,12 +203,14 @@ class Agent:
             state.setdefault("errors", []).append(
                 "La comparación requiere un segundo documento."
             )
+
             state.setdefault("metadata", {}).update(
                 {
                     "executed_tool": "compare_documents",
                     "comparison_generated": False,
                 }
             )
+
             return state
 
         result = self.comparison_service.compare_documents(

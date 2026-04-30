@@ -4,19 +4,16 @@ import os
 import tempfile
 from typing import Any
 
-import fitz  # PyMuPDF
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from markitdown import MarkItDown
-from app.schemas.analytics import FinancialMetric
-from app.schemas.analytics import AnalyticsExtraction, AnalyticsInsights
-from pydantic import BaseModel, Field
 
 from app.config import DEFAULT_MODEL_NAME
 from app.prompts.analytics_prompts import (
     ANALYTICS_INSIGHTS_PROMPT,
     FINANCIAL_EXTRACTION_PROMPT,
 )
+from app.schemas.analytics import AnalyticsExtraction, AnalyticsInsights, FinancialMetric
 
 logger = logging.getLogger(__name__)
 
@@ -24,197 +21,253 @@ logger = logging.getLogger(__name__)
 class AnalyticsService:
     def __init__(self):
         self.markitdown = MarkItDown()
-        self.extraction_llm = ChatOpenAI(model=DEFAULT_MODEL_NAME, temperature=0).with_structured_output(AnalyticsExtraction)
-        self.insights_llm = ChatOpenAI(model=DEFAULT_MODEL_NAME, temperature=0).with_structured_output(AnalyticsInsights)
         self.extraction_prompt = ChatPromptTemplate.from_template(FINANCIAL_EXTRACTION_PROMPT)
         self.insights_prompt = ChatPromptTemplate.from_template(ANALYTICS_INSIGHTS_PROMPT)
 
-    def analyze(self, raw_text: str, document_type: str, file_bytes: bytes | None = None, filename: str | None = None) -> dict[str, Any]:
-        warnings = []
-        raw_text = str(raw_text or "").strip()
+        self.extraction_llm = ChatOpenAI(
+            model=DEFAULT_MODEL_NAME,
+            temperature=0,
+        ).with_structured_output(AnalyticsExtraction)
 
-        # Extraer contenido con triple fallback mejorado
-        content = self._get_universal_content(raw_text, file_bytes, filename, warnings)
+        self.insights_llm = ChatOpenAI(
+            model=DEFAULT_MODEL_NAME,
+            temperature=0,
+        ).with_structured_output(AnalyticsInsights)
 
-        # Log de depuración crítico
-        preview = (content[:500] if content else "EMPTY_OR_NONE_OBJECT")
-        logger.info(f"Analytics content preview (first 500 chars): {preview}")
+    def analyze(
+        self,
+        raw_text: str,
+        document_type: str,
+        file_bytes: bytes | None = None,
+        filename: str | None = None,
+    ) -> dict[str, Any]:
+        warnings: list[str] = []
 
-        if not content or len(content.strip()) < 100 or content.lower() == "none":
+        content = self._extract_markdown(file_bytes, filename)
+
+        if not self._is_valid_text(content):
             return self._empty_result(
                 document_type=document_type,
-                warnings=["No se pudo obtener texto legible para analítica financiera."],
-                method="failed_extraction",
-                filename=filename
+                filename=filename,
+                warnings=["No se pudo extraer contenido útil con MarkItDown."],
             )
 
         extraction = self._extract_metrics(content)
         rows = self._build_rows(extraction.metrics)
-        
+
+        if not rows:
+            warnings.append("No se detectaron métricas financieras comparativas claras.")
+
+        chart_specs = self._build_chart_specs(rows)
+
         return {
             "document_type": document_type,
             "rows": rows,
             "metrics": self._build_metrics_preview(rows),
             "percentages": self._build_percentages_preview(rows),
-            "chart_specs": self._build_chart_specs(rows),
+            "chart_specs": chart_specs,
             "insights": self._generate_insights(rows),
-            "warnings": warnings if rows else warnings + ["No se detectaron métricas financieras claras."],
+            "warnings": warnings,
             "metadata": {
-                "method": "universal_extraction_v2",
+                "method": "markitdown_llm_structured_analytics",
                 "metrics_detected": len(rows),
+                "charts_generated": len(chart_specs),
                 "source_filename": filename,
             },
         }
 
-    def _get_universal_content(self, raw_text: str, file_bytes: bytes | None, filename: str | None, warnings: list[str]) -> str:
+    def _extract_markdown(self, file_bytes: bytes | None, filename: str | None) -> str:
         if not file_bytes:
-            return raw_text if not self._looks_like_binary_pdf(raw_text) else ""
+            return ""
 
-        suffix = self._get_suffix(filename)
         temp_path = None
 
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-                f.write(file_bytes)
-                temp_path = f.name
+            with tempfile.NamedTemporaryFile(delete=False, suffix=self._suffix(filename)) as file:
+                file.write(file_bytes)
+                temp_path = file.name
 
-            # CAPA 1: MarkItDown (con validación de calidad)
-            try:
-                result = self.markitdown.convert(temp_path)
-                if result and result.text_content:
-                    text = result.text_content.strip()
-                    # VALIDACIÓN: Si es muy corto o dice "None", lo ignoramos y pasamos a Capa 2
-                    if len(text) > 100 and text.lower() != "none" and not self._looks_like_binary_pdf(text):
-                        logger.info("Capa 1: MarkItDown exitosa")
-                        return text
-            except Exception as e:
-                logger.warning(f"Capa 1 (MarkItDown) falló: {e}")
+            result = self.markitdown.convert(temp_path)
+            return str(getattr(result, "text_content", "") or "").strip()
 
-            if suffix == ".pdf":
-                text = self._extract_with_pymupdf(file_bytes)
-                if len(text) > 100 and text.lower() != "none" and not self._looks_like_binary_pdf(text):
-                    logger.info("Capa 2: PyMuPDF exitosa")
-                    return text
-
-            if raw_text and len(raw_text) > 100 and not self._looks_like_binary_pdf(raw_text):
-                logger.info("Capa 3: Usando fallback de raw_text")
-                return raw_text
-
+        except Exception as exc:
+            logger.warning("MarkItDown falló en analytics: %s", exc)
             return ""
 
-        except Exception as e:
-            logger.error(f"Error en _get_universal_content: {e}")
-            return ""
         finally:
             if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)
 
-    def _extract_with_pymupdf(self, file_bytes: bytes) -> str:
-        try:
-            doc = fitz.open(stream=file_bytes, filetype="pdf")
-            return "\n".join([page.get_text() for page in doc]).strip()
-        except Exception as e:
-            logger.warning(f"PyMuPDF falló: {e}")
-            return ""
-
-    @staticmethod
-    def _looks_like_binary_pdf(text: str) -> bool:
-        return str(text or "").lstrip().startswith("%PDF")
-
-    @staticmethod
-    def _get_suffix(filename: str | None) -> str:
-        if filename and "." in filename:
-            return "." + filename.rsplit(".", 1)[-1].lower()
-        return ".pdf"
-
     def _extract_metrics(self, content: str) -> AnalyticsExtraction:
-        chain = self.extraction_prompt | self.extraction_llm
         try:
+            chain = self.extraction_prompt | self.extraction_llm
             return chain.invoke({"texto": content[:60_000]})
-        except Exception as e:
-            logger.error(f"Error LLM: {e}")
+
+        except Exception as exc:
+            logger.error("Error extrayendo métricas financieras: %s", exc)
             return AnalyticsExtraction()
 
     def _build_rows(self, metrics: list[FinancialMetric]) -> list[dict[str, Any]]:
         rows = []
         seen = set()
-        for m in metrics:
-            label = (m.label or "").strip()
-            if not label: continue
-            v1, v2 = float(m.value_current), float(m.value_previous)
-            key = (label.lower(), v1, v2)
-            if key in seen: continue
+
+        for metric in metrics:
+            label = self._clean(metric.label)
+            if not label:
+                continue
+
+            value_1 = float(metric.value_current)
+            value_2 = float(metric.value_previous)
+
+            key = (label.lower(), value_1, value_2)
+            if key in seen:
+                continue
+
             seen.add(key)
-            rows.append({
-                "statement": m.category, "section": m.category, "label": label,
-                "period_1": m.period_current or "Actual", "value_1": v1,
-                "period_2": m.period_previous or "Anterior", "value_2": v2,
-                "unit": m.unit, "delta_abs": round(v1 - v2, 2),
-                "delta_pct": None if v2 == 0 else round(((v1 - v2) / abs(v2)) * 100, 2),
-            })
+
+            rows.append(
+                {
+                    "statement": metric.category or "other",
+                    "section": metric.category or "other",
+                    "label": label,
+                    "period_1": metric.period_current or "Actual",
+                    "value_1": value_1,
+                    "period_2": metric.period_previous or "Anterior",
+                    "value_2": value_2,
+                    "unit": metric.unit or "",
+                    "delta_abs": round(value_1 - value_2, 2),
+                    "delta_pct": self._delta_pct(value_1, value_2),
+                }
+            )
+
         return rows
 
-    @staticmethod
-    def _build_metrics_preview(rows):
-        return [{"label": r["label"], "value": r["value_1"], "raw_value": str(r["value_1"]), "context": r.get("section")} for r in rows[:30]]
-
-    @staticmethod
-    def _build_percentages_preview(rows):
-        return [{"label": f"{r['label']} var", "value": r["delta_pct"], "raw_value": f"{r['delta_pct']}%", "context": f"{r['period_1']} vs {r['period_2']}"} for r in rows if r.get("delta_pct") is not None][:30]
-
-    def _build_chart_specs(self, rows):
-        if not rows: return []
-        top = rows[:10]
-        return [{"title": "Comparativa Financiera", "chart_type": "bar", "series": [{"name": "Actual", "data": [{"x": r["label"], "y": r["value_1"]} for r in top]}, {"name": "Anterior", "data": [{"x": r["label"], "y": r["value_2"]} for r in top]}]}]
-
     def _generate_insights(self, rows: list[dict[str, Any]]) -> list[str]:
-        """
-        Genera insights de negocio utilizando el prompt ANALYTICS_INSIGHTS_PROMPT
-        basándose en los datos estructurados y calculados.
-        """
         if not rows:
             return []
 
         try:
-            # IMPORTANTE: Creamos la cadena uniendo el prompt y el LLM con salida estructurada
             chain = self.insights_prompt | self.insights_llm
-            
-            # Convertimos las filas a JSON para que el LLM pueda procesarlas
-            # Solo enviamos las primeras 30 para no saturar el contexto del modelo
-            datos_json = json.dumps(rows[:30], ensure_ascii=False, indent=2)
-            
-            logger.info(f"Generando insights para {len(rows[:30])} métricas...")
-            
-            # Invocamos la cadena pasando la variable {datos} que espera tu prompt
-            result = chain.invoke({"datos": datos_json})
-            
-            # Retornamos la lista de strings (insights) limitada a 6 elementos
-            # result es una instancia de AnalyticsInsights (Pydantic)
-            insights_limpios = [str(i).strip() for i in result.insights if i]
-            
-            return insights_limpios[:6]
+            result = chain.invoke(
+                {
+                    "datos": json.dumps(
+                        rows[:30],
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                }
+            )
+            return [str(item).strip() for item in result.insights[:6] if str(item).strip()]
 
-        except Exception as e:
-            logger.error(f"Error en la generación de insights financieros: {e}")
-            # Si falla el LLM, podrías devolver insights básicos basados en lógica de código
-            return self._generate_basic_insights(rows)
+        except Exception as exc:
+            logger.warning("Error generando insights financieros: %s", exc)
+            return self._basic_insights(rows)
 
     @staticmethod
-    def _generate_basic_insights(rows: list[dict[str, Any]]) -> list[str]:
-        """Fallback manual si el LLM de insights falla."""
-        insights = []
-        # Ordenamos por mayor variación porcentual absoluta
-        sorted_rows = sorted(
-            [r for r in rows if r.get("delta_pct") is not None],
-            key=lambda r: abs(r["delta_pct"]),
-            reverse=True
+    def _build_metrics_preview(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "label": row["label"],
+                "value": row["value_1"],
+                "raw_value": str(row["value_1"]),
+                "context": row.get("section"),
+            }
+            for row in rows[:30]
+        ]
+
+    @staticmethod
+    def _build_percentages_preview(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "label": f"{row['label']} var",
+                "value": row["delta_pct"],
+                "raw_value": f"{row['delta_pct']}%",
+                "context": f"{row['period_1']} vs {row['period_2']}",
+            }
+            for row in rows
+            if row.get("delta_pct") is not None
+        ][:30]
+
+    @staticmethod
+    def _build_chart_specs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not rows:
+            return []
+
+        top = rows[:10]
+
+        return [
+            {
+                "title": "Comparativa financiera",
+                "chart_type": "bar",
+                "reason": "Compara el periodo actual frente al periodo anterior.",
+                "series": [
+                    {
+                        "name": "Actual",
+                        "data": [{"x": row["label"], "y": row["value_1"]} for row in top],
+                    },
+                    {
+                        "name": "Anterior",
+                        "data": [{"x": row["label"], "y": row["value_2"]} for row in top],
+                    },
+                ],
+            }
+        ]
+
+    @staticmethod
+    def _basic_insights(rows: list[dict[str, Any]]) -> list[str]:
+        ordered = sorted(
+            [row for row in rows if row.get("delta_pct") is not None],
+            key=lambda row: abs(row["delta_pct"]),
+            reverse=True,
         )
-        for r in sorted_rows[:3]:
-            dir_str = "aumentó" if r["delta_pct"] > 0 else "disminuyó"
-            insights.append(f"La métrica '{r['label']}' {dir_str} un {abs(r['delta_pct'])}% respecto al periodo anterior.")
-        
-        return insights
+
+        return [
+            f"{row['label']} {'aumentó' if row['delta_pct'] > 0 else 'disminuyó'} "
+            f"un {abs(row['delta_pct'])}% respecto al periodo anterior."
+            for row in ordered[:3]
+        ]
 
     @staticmethod
-    def _empty_result(document_type, warnings, method, filename):
-        return {"document_type": document_type, "rows": [], "metrics": [], "percentages": [], "chart_specs": [], "insights": [], "warnings": warnings, "metadata": {"method": method, "source_filename": filename}}
+    def _is_valid_text(text: str | None) -> bool:
+        clean = str(text or "").strip()
+        return bool(clean) and clean.lower() not in {"none", "null", "nan"} and not clean.startswith("%PDF")
+
+    @staticmethod
+    def _clean(value: str | None) -> str:
+        return " ".join(str(value or "").strip().split())
+
+    @staticmethod
+    def _delta_pct(value_1: float, value_2: float) -> float | None:
+        if value_2 == 0:
+            return None
+
+        return round(((value_1 - value_2) / abs(value_2)) * 100, 2)
+
+    @staticmethod
+    def _suffix(filename: str | None) -> str:
+        if filename and "." in filename:
+            return "." + filename.rsplit(".", 1)[-1].lower()
+
+        return ".txt"
+
+    @staticmethod
+    def _empty_result(
+        document_type: str,
+        filename: str | None,
+        warnings: list[str],
+    ) -> dict[str, Any]:
+        return {
+            "document_type": document_type,
+            "rows": [],
+            "metrics": [],
+            "percentages": [],
+            "chart_specs": [],
+            "insights": [],
+            "warnings": warnings,
+            "metadata": {
+                "method": "markitdown_llm_structured_analytics",
+                "metrics_detected": 0,
+                "charts_generated": 0,
+                "source_filename": filename,
+            },
+        }

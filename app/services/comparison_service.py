@@ -3,22 +3,12 @@ from typing import Any
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel, Field
 
 from app.config import DEFAULT_MODEL_NAME
 from app.prompts.comparison_prompts import DOCUMENT_COMPARISON_PROMPT
+from app.schemas.comparison import ComparisonExtraction
 
 logger = logging.getLogger(__name__)
-
-
-class ComparisonExtraction(BaseModel):
-    document_a_summary: str | None = None
-    document_b_summary: str | None = None
-    document_a_keywords: list[str] = Field(default_factory=list)
-    document_b_keywords: list[str] = Field(default_factory=list)
-    similarities: list[str] = Field(default_factory=list)
-    differences: list[str] = Field(default_factory=list)
-    comparison_summary: str | None = None
 
 
 class ComparisonService:
@@ -43,8 +33,6 @@ class ComparisonService:
         text_a = str(text_a or "").strip()
         text_b = str(text_b or "").strip()
         user_request = str(user_request or "Compara estos dos documentos.").strip()
-
-        warnings: list[str] = []
 
         if not text_a:
             return self._empty_result(
@@ -78,6 +66,10 @@ class ComparisonService:
                 "document_b_keywords": self._clean_list(result.document_b_keywords),
                 "similarities": self._clean_list(result.similarities),
                 "differences": self._clean_list(result.differences),
+                "document_a_advantages": self._clean_list(result.document_a_advantages),
+                "document_a_disadvantages": self._clean_list(result.document_a_disadvantages),
+                "document_b_advantages": self._clean_list(result.document_b_advantages),
+                "document_b_disadvantages": self._clean_list(result.document_b_disadvantages),
                 "comparison_summary": result.comparison_summary,
                 "metadata": {
                     "method": "structured_llm_document_comparison",
@@ -99,15 +91,11 @@ class ComparisonService:
 
     @staticmethod
     def _clean_list(items: list[str]) -> list[str]:
-        cleaned = []
-
-        for item in items or []:
-            value = str(item).strip()
-
-            if value:
-                cleaned.append(value)
-
-        return cleaned
+        return [
+            str(item).strip()
+            for item in items or []
+            if str(item).strip()
+        ]
 
     @staticmethod
     def _empty_result(
@@ -122,6 +110,10 @@ class ComparisonService:
             "document_b_keywords": [],
             "similarities": [],
             "differences": [],
+            "document_a_advantages": [],
+            "document_a_disadvantages": [],
+            "document_b_advantages": [],
+            "document_b_disadvantages": [],
             "comparison_summary": None,
             "metadata": {
                 "method": "structured_llm_document_comparison",
